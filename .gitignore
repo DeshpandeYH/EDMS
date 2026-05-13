@@ -1,0 +1,13 @@
+# Generated drawings
+outputs/
+# User-uploaded templates (large binaries; track templates separately if needed)
+uploads/
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+# Temp / build
+*.tmp
+*.bak
+*.err
