@@ -58,9 +58,10 @@ $engCombos = [['key' => '', 'pairs' => []]];
 foreach ($engAttrs as $a) {
     $opts = $db->prepare("SELECT id, code FROM attribute_options WHERE attribute_id = ? AND is_active = 1 ORDER BY sort_order");
     $opts->execute([$a['id']]);
+    $optRows = $opts->fetchAll();
     $new = [];
     foreach ($engCombos as $c) {
-        foreach ($opts->fetchAll() as $o) {
+        foreach ($optRows as $o) {
             $new[] = ['key' => $c['key'] === '' ? $o['code'] : $c['key'].'-'.$o['code'], 'pairs' => [...$c['pairs'], ['attr_id'=>$a['id'],'option_id'=>$o['id']]]];
         }
     }

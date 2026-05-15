@@ -85,6 +85,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $cert_tmpl->execute([$line_data['product_code_id']]);
             $tmpl = $cert_tmpl->fetch();
 
+            // If none exists, auto-create a placeholder so the FK in
+            // generated_certificates (which may still be NOT NULL on some
+            // databases) can be satisfied. The placeholder carries enough
+            // metadata for QC to know this is a stub.
+            if (!$tmpl) {
+                $newId = generateUUID();
+                $db->prepare("INSERT INTO cert_templates (id, product_code_id, template_code, file_path, version, is_active) VALUES (?, ?, ?, ?, 1, 1)")
+                   ->execute([$newId, $line_data['product_code_id'], $line_data['product_code'].'-CERT-AUTO', '']);
+                $tmpl = ['id' => $newId];
+            }
+
             // Write a real fallback certificate file so the row points at something
             // that actually exists on disk. XLSX template processing requires
             // PhpSpreadsheet which isn't installed; the .txt fallback gives QC and
@@ -135,7 +146,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $db->prepare("INSERT INTO generated_certificates (id, so_line_item_id, cert_template_id, certificate_number, output_file_path, merged_values, inspector_name, inspection_date, status) VALUES (NEWID(), ?, ?, ?, ?, ?, ?, ?, 'generated')")
-               ->execute([$line_id, $tmpl ? $tmpl['id'] : null, $cert_number, $outFile, $merged, $mfg_data['inspector_name'], $mfg_data['inspection_date']]);
+               ->execute([$line_id, $tmpl['id'], $cert_number, $outFile, $merged, $mfg_data['inspector_name'], $mfg_data['inspection_date']]);
 
             setFlash('success', "Certificate $cert_number generated as text fallback. Install PhpSpreadsheet + upload a cert_template for proper XLSX output.");
         } else {
