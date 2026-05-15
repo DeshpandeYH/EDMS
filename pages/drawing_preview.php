@@ -169,10 +169,15 @@ $backSoId          = $doc['sales_order_id'] ?? '';
 <!-- DRAWING PREVIEW -->
 <div class="panel">
     <div class="panel-header">
-        <span class="panel-title"><?= $type_label ?> Drawing</span>
+        <span class="panel-title">Data Preview — Schematic (not your DWG)</span>
         <span class="tag tag-<?= $doc['status'] === 'approved' ? 'green' : 'blue' ?>"><?= ucfirst($doc['status']) ?></span>
     </div>
     <div class="panel-body">
+        <div class="callout callout-info" style="margin-bottom:1rem;font-size:0.85rem;">
+            <strong>Heads up:</strong> the diagram below is a <em>schematic</em> EDMS draws from the order data — it is <strong>NOT</strong> a render of your uploaded DWG template.
+            The actual generated file <em>does</em> use your template — every <code>&lt;&lt;TAG&gt;&gt;</code> in it gets substituted with the values shown above.
+            To see the real drawing, click <strong>Download DWG/DXF</strong> at the bottom of this page and open it in DraftSight.
+        </div>
         <?php
         // Build an SVG schematic of the produced drawing using the same
         // data that gets injected into the DWG. This is not a pixel-perfect
@@ -280,6 +285,66 @@ $backSoId          = $doc['sales_order_id'] ?? '';
             </text>
         </svg>
         </div>
+    </div>
+</div>
+
+<!-- ACTUAL FILE CONTENT PREVIEW -->
+<?php
+// Show what's REALLY inside the generated file so the user can see their
+// template's content with substituted values — NOT a schematic.
+$realPath = $doc['output_file_path'] ?? '';
+$realText = '';
+$realSize = 0;
+$realExt = '';
+if ($realPath && is_file($realPath)) {
+    $realSize = filesize($realPath);
+    $realExt = strtolower(pathinfo($realPath, PATHINFO_EXTENSION));
+    if ($realExt === 'dxf' && $realSize < 5 * 1024 * 1024) {
+        $raw = file_get_contents($realPath);
+        // Extract every TEXT entity's string (DXF group code 1 after a TEXT entity).
+        preg_match_all('/^\s*0\s*\nTEXT\s*$.*?^\s*1\s*\n([^\n]*)\n/sm', $raw, $matches);
+        $realText = $matches[1] ?? [];
+    }
+}
+?>
+<div class="panel">
+    <div class="panel-header">
+        <span class="panel-title">Actual Generated File</span>
+        <span class="tag tag-<?= $realPath && is_file($realPath) ? 'green' : 'red' ?>">
+            <?= $realPath && is_file($realPath) ? strtoupper($realExt) . ' · ' . number_format($realSize) . ' bytes' : 'FILE MISSING' ?>
+        </span>
+    </div>
+    <div class="panel-body">
+        <?php if ($realPath && is_file($realPath)): ?>
+        <div class="callout callout-success" style="margin-bottom:0.75rem;font-size:0.85rem;">
+            <strong>This is what got written to disk</strong> — your uploaded template was copied, every <code>&lt;&lt;TAG&gt;&gt;</code> in it was substituted, and the model-code and dimension tables were drawn at their anchors. Below: every text string the engine put into the file.
+        </div>
+        <div style="font-family:'Consolas',monospace;font-size:0.8rem;background:var(--bg-2,#0f1726);border:1px solid var(--border);border-radius:4px;padding:0.5rem 0.75rem;max-height:300px;overflow:auto;">
+            <?php if (is_array($realText) && !empty($realText)): ?>
+                <?php foreach ($realText as $i => $t):
+                    if (trim($t) === '') continue;
+                    $isPlaceholder = (strpos($t, '<<') !== false);
+                ?>
+                <div style="color:<?= $isPlaceholder ? '#ff6b6b' : '#cfd8e8' ?>;">
+                    <span style="color:#6b7a90;"><?= str_pad((string)($i+1), 3, ' ', STR_PAD_LEFT) ?>:</span>
+                    <?= sanitize($t) ?>
+                    <?= $isPlaceholder ? ' <span style="color:#ff6b6b;font-size:0.7rem;">← UNSUBSTITUTED PLACEHOLDER</span>' : '' ?>
+                </div>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <em style="color:#6b7a90;">No TEXT entities found (DWG round-trip strips text strings — preview only works on .dxf files).</em>
+            <?php endif; ?>
+        </div>
+        <div style="font-size:0.75rem;color:var(--text-dim);margin-top:0.5rem;">
+            Path: <code><?= sanitize($realPath) ?></code>
+            <?php $hasUnsub = is_array($realText) && array_filter($realText, fn($t) => strpos($t, '<<') !== false);
+            if ($hasUnsub): ?>
+                <br><strong style="color:#ff6b6b;">⚠ Unsubstituted placeholders detected.</strong> Add a row in <a href="template_fields.php?template_id=<?= sanitize($doc['template_id'] ?? '') ?>">Template Field Mappings</a> for each one, or use one of the hardcoded tags listed there.
+            <?php endif; ?>
+        </div>
+        <?php else: ?>
+        <em>No output file on disk. Re-run "Generate Documents" on the sales order.</em>
+        <?php endif; ?>
     </div>
 </div>
 
