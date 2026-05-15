@@ -78,8 +78,17 @@ class DWGTemplateProcessor {
         // 2a. Apply user-defined template_field_mappings on top of the hardcoded
         // placeholders. This lets engineering add custom <<TAGS>> in their DWG
         // (e.g. <<MEASURING_RANGE>>) and resolve them from any source.
-        if (!empty($fieldMappings)) {
-            $dxfContent = $this->injectUserMappings($dxfContent, $fieldMappings, $orderData, $selections);
+        // Resolve mappings once so we can both (a) substitute the literal
+        // <<TAG>> text wherever it appears in the template, and (b) render
+        // the values into the visible EDMS stamp below so they always show
+        // even when the template doesn't have the literal placeholder text.
+        $resolvedMappings = $this->resolveFieldMappings($fieldMappings, $orderData, $selections);
+        if (!empty($resolvedMappings)) {
+            $tagMap = [];
+            foreach ($resolvedMappings as $r) {
+                $tagMap[$r['tag']] = $this->sanitizeForDxf($r['value']);
+            }
+            $dxfContent = strtr($dxfContent, $tagMap);
         }
 
         $modelHeaders = ['Pos','Attribute','Code','Value'];
@@ -119,9 +128,12 @@ class DWGTemplateProcessor {
         // 2c. Always stamp a compact order-info overlay block. This is
         // visible proof that the file was processed by EDMS and carries the
         // SO/customer/model code regardless of template annotation state.
+        // Resolved field mappings are appended as additional rows so user-
+        // configured fields appear on the drawing even when the template
+        // lacks the literal <<TAG>> text entities.
         $dxfContent = $this->appendEntities(
             $dxfContent,
-            $this->renderInfoStamp($orderData)
+            $this->renderInfoStamp($orderData, $resolvedMappings)
         );
 
         if (!is_dir($outDir)) {
@@ -274,30 +286,41 @@ class DWGTemplateProcessor {
      * mappings can never accidentally break table injection.
      */
     public function injectUserMappings(string $dxf, array $fieldMappings, array $orderData, array $selections): string {
+        $resolved = $this->resolveFieldMappings($fieldMappings, $orderData, $selections);
+        if (empty($resolved)) return $dxf;
+        $map = [];
+        foreach ($resolved as $r) {
+            $map[$r['tag']] = $this->sanitizeForDxf($r['value']);
+        }
+        return strtr($dxf, $map);
+    }
+
+    /**
+     * Resolve template_field_mappings rows against the current order/selections
+     * and return an ordered list of ['tag' => '<<...>>', 'value' => '...'].
+     *
+     * Used by both injectUserMappings() (to substitute literal <<TAG>> text in
+     * the template) AND renderInfoStamp() (to display the resolved values in
+     * the EDMS overlay so they appear even when the template has no <<TAGS>>).
+     */
+    public function resolveFieldMappings(array $fieldMappings, array $orderData, array $selections): array {
         $reserved = [
             '<<MODEL_CODE_TABLE>>', '<<DIM_TABLE>>',
             '<<CUSTOMER>>', '<<PROJECT>>', '<<SO_NO>>', '<<PO_REF>>',
             '<<MODEL_CODE>>', '<<PRODUCT>>', '<<PRODUCT_NAME>>',
             '<<DATE>>', '<<DELIVERY>>', '<<QTY>>', '<<DRG_NO>>',
         ];
-
-        // Common alias map for so_header / so_line keys: the UI may store the
-        // raw SQL column name (model_code_string) while $orderData uses a
-        // friendlier alias (model_code).
         $aliases = [
             'model_code_string' => 'model_code',
             'so_header.so_number' => 'so_number',
         ];
-
-        $map = [];
+        $out = [];
         foreach ($fieldMappings as $m) {
             $tag = trim($m['dwg_field_name'] ?? '');
             if ($tag === '' || in_array($tag, $reserved, true)) continue;
-
             $type = $m['source_type']   ?? '';
             $key  = trim($m['source_key']    ?? '');
             $def  = (string)($m['default_value'] ?? '');
-
             $val = '';
             switch ($type) {
                 case 'so_header':
@@ -305,7 +328,6 @@ class DWGTemplateProcessor {
                     $k = $aliases[$key] ?? $key;
                     $val = (string)($orderData[$k] ?? '');
                     break;
-
                 case 'attribute_option':
                     foreach ($selections as $s) {
                         if (($s['attr_code'] ?? null) === $key) {
@@ -314,7 +336,6 @@ class DWGTemplateProcessor {
                         }
                     }
                     break;
-
                 case 'dimension_modifier':
                     foreach ($selections as $s) {
                         $mods = [];
@@ -328,19 +349,14 @@ class DWGTemplateProcessor {
                         }
                     }
                     break;
-
                 case 'static':
                     $val = $def;
                     break;
             }
-
-            // Fall back to default if nothing resolved.
             if ($val === '' && $def !== '') $val = $def;
-
-            $map[$tag] = $this->sanitizeForDxf($val);
+            $out[] = ['tag' => $tag, 'value' => $val];
         }
-
-        return $map ? strtr($dxf, $map) : $dxf;
+        return $out;
     }
 
     /** Strip characters that confuse DXF text fields. */
@@ -537,7 +553,7 @@ class DWGTemplateProcessor {
      * that the file carries this order's data, even when the template
      * had no <<TAGS>> for the title block.
      */
-    private function renderInfoStamp(array $o): string {
+    private function renderInfoStamp(array $o, array $resolvedMappings = []): string {
         $lines = [
             'SO NO     : ' . ($o['so_number']     ?? ''),
             'CUSTOMER  : ' . ($o['customer_name'] ?? ''),
@@ -548,6 +564,20 @@ class DWGTemplateProcessor {
             'QTY       : ' . ($o['quantity']      ?? ''),
             'DATE      : ' . date('d-m-Y'),
         ];
+
+        // Append each resolved field mapping as a labeled row so the user
+        // sees their custom-mapped fields on the drawing even when the
+        // template has no literal <<TAG>> placeholders.
+        if (!empty($resolvedMappings)) {
+            $lines[] = str_repeat('-', 26);
+            foreach ($resolvedMappings as $r) {
+                $label = trim(str_replace(['<<', '>>'], '', (string)$r['tag']));
+                if ($label === '') continue;
+                $label = strtoupper($label);
+                if (strlen($label) > 10) $label = substr($label, 0, 10);
+                $lines[] = str_pad($label, 10) . ': ' . (string)$r['value'];
+            }
+        }
         $x0 = 280.0; $y0 = 290.0;     // top-right area on a typical A3 sheet
         $w  = 130.0; $rowH = 5.0;
         $h  = $rowH * (count($lines) + 1);
