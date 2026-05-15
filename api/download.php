@@ -184,6 +184,13 @@ if ($useTemplate) {
         if ($format === 'dwg' && !$proc->isAvailable()) {
             $format = 'dxf';
         }
+        // Fetch user-defined field mappings for this template.
+        $fieldMappings = [];
+        if (!empty($doc['template_id'])) {
+            $fm = $db->prepare("SELECT dwg_field_name, source_type, source_key, default_value FROM template_field_mappings WHERE template_id = ?");
+            $fm->execute([$doc['template_id']]);
+            $fieldMappings = $fm->fetchAll();
+        }
         $producedPath = $proc->process(
             $templateFile,
             $orderData,
@@ -192,7 +199,8 @@ if ($useTemplate) {
             $outputDir,
             $download_name,
             $format,
-            $anchorConfig
+            $anchorConfig,
+            $fieldMappings
         );
         $outFmt = strtolower(pathinfo($producedPath, PATHINFO_EXTENSION));
         $mime   = $outFmt === 'dwg' ? 'application/acad' : 'application/dxf';

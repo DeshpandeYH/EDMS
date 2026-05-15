@@ -9,6 +9,10 @@ config/config.local.php
 .DS_Store
 Thumbs.db
 *.log
+# Email / reference attachments dropped in the repo root
+*.zip
+*.eml
+*.msg
 # Temp / build
 *.tmp
 *.bak

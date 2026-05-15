@@ -234,13 +234,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     // Run the processor — copy template, inject SO data, save as new DWG.
                     $producedAbs = null;
+                    // Fetch user-defined field mappings for this specific template.
+                    $fieldMappings = [];
+                    if ($template_id) {
+                        $fm = $db->prepare("SELECT dwg_field_name, source_type, source_key, default_value FROM template_field_mappings WHERE template_id = ?");
+                        $fm->execute([$template_id]);
+                        $fieldMappings = $fm->fetchAll();
+                    }
                     try {
                         if ($tplFile) {
                             $proc = new DWGTemplateProcessor();
                             $fmt  = ($proc->isAvailable()) ? 'dwg' : 'dxf';
                             $producedAbs = $proc->process(
                                 $tplFile, $orderData, $selsFull, $dimColumns,
-                                $outDir, $baseName, $fmt, $anchorConfig
+                                $outDir, $baseName, $fmt, $anchorConfig, $fieldMappings
                             );
                         } else {
                             // No template available — fall back to from-scratch DXF.
@@ -503,13 +510,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!is_dir($outDir)) @mkdir($outDir, 0755, true);
 
                 $producedAbs = null;
+                // Fetch user-defined field mappings for this specific template.
+                $fieldMappings = [];
+                if ($template_id) {
+                    $fm = $db->prepare("SELECT dwg_field_name, source_type, source_key, default_value FROM template_field_mappings WHERE template_id = ?");
+                    $fm->execute([$template_id]);
+                    $fieldMappings = $fm->fetchAll();
+                }
                 try {
                     if ($tplFile) {
                         $proc = new DWGTemplateProcessor();
                         $fmt  = ($proc->isAvailable()) ? 'dwg' : 'dxf';
                         $producedAbs = $proc->process(
                             $tplFile, $orderData, $g['all_sels_template'], $dimColumns,
-                            $outDir, $baseName, $fmt, $anchorConfig
+                            $outDir, $baseName, $fmt, $anchorConfig, $fieldMappings
                         );
                     } else {
                         $gen = new DXFGenerator();

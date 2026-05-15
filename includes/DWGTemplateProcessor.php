@@ -43,6 +43,9 @@ class DWGTemplateProcessor {
      * @param string $outDir        Folder to drop the produced file into.
      * @param string $outBaseName   File name (without extension).
      * @param string $outFormat     'dwg' or 'dxf'.
+     * @param array  $anchorConfig  Per-product anchor X/Y for fallback placement.
+     * @param array  $fieldMappings Rows from template_field_mappings for this template.
+     *                              Each row: ['dwg_field_name','source_type','source_key','default_value'].
      * @return string Absolute path of the produced file.
      */
     public function process(
@@ -53,7 +56,8 @@ class DWGTemplateProcessor {
         string $outDir,
         string $outBaseName,
         string $outFormat = 'dwg',
-        array $anchorConfig = []
+        array $anchorConfig = [],
+        array $fieldMappings = []
     ): string {
         if (!is_file($templatePath)) {
             throw new RuntimeException("Template not found: $templatePath");
@@ -70,6 +74,13 @@ class DWGTemplateProcessor {
 
         // 2. Inject data.
         $dxfContent = $this->injectPlaceholders($dxfContent, $orderData);
+
+        // 2a. Apply user-defined template_field_mappings on top of the hardcoded
+        // placeholders. This lets engineering add custom <<TAGS>> in their DWG
+        // (e.g. <<MEASURING_RANGE>>) and resolve them from any source.
+        if (!empty($fieldMappings)) {
+            $dxfContent = $this->injectUserMappings($dxfContent, $fieldMappings, $orderData, $selections);
+        }
 
         $modelHeaders = ['Pos','Attribute','Code','Value'];
         $modelRows    = $this->buildModelCodeRows($orderData, $selections);
@@ -240,6 +251,96 @@ class DWGTemplateProcessor {
             '<<DRG_NO>>'        => $orderData['model_code']     ?? '',
         ];
         return strtr($dxf, array_map([$this, 'sanitizeForDxf'], $map));
+    }
+
+    /**
+     * Apply user-defined template_field_mappings to the DXF text.
+     *
+     * Each mapping is a row from template_field_mappings:
+     *   ['dwg_field_name', 'source_type', 'source_key', 'default_value']
+     *
+     * source_type values:
+     *   - so_header: pull from $orderData (so_number, customer_name, project_name,
+     *                po_reference, delivery_date)
+     *   - so_line:   pull from $orderData (model_code, quantity, line_number,
+     *                product_code, product_name, sap_item_code, template_code)
+     *   - attribute_option: source_key is the attribute CODE (e.g. 'MR');
+     *                value resolved from the matching selection's display_label/opt_value
+     *   - dimension_modifier: source_key is a key inside any selection's
+     *                attribute_options.dimension_modifiers JSON (e.g. 'L')
+     *   - static:    just emit the default_value verbatim
+     *
+     * Reserved tag names (anchors and the hardcoded set) are skipped so user
+     * mappings can never accidentally break table injection.
+     */
+    public function injectUserMappings(string $dxf, array $fieldMappings, array $orderData, array $selections): string {
+        $reserved = [
+            '<<MODEL_CODE_TABLE>>', '<<DIM_TABLE>>',
+            '<<CUSTOMER>>', '<<PROJECT>>', '<<SO_NO>>', '<<PO_REF>>',
+            '<<MODEL_CODE>>', '<<PRODUCT>>', '<<PRODUCT_NAME>>',
+            '<<DATE>>', '<<DELIVERY>>', '<<QTY>>', '<<DRG_NO>>',
+        ];
+
+        // Common alias map for so_header / so_line keys: the UI may store the
+        // raw SQL column name (model_code_string) while $orderData uses a
+        // friendlier alias (model_code).
+        $aliases = [
+            'model_code_string' => 'model_code',
+            'so_header.so_number' => 'so_number',
+        ];
+
+        $map = [];
+        foreach ($fieldMappings as $m) {
+            $tag = trim($m['dwg_field_name'] ?? '');
+            if ($tag === '' || in_array($tag, $reserved, true)) continue;
+
+            $type = $m['source_type']   ?? '';
+            $key  = trim($m['source_key']    ?? '');
+            $def  = (string)($m['default_value'] ?? '');
+
+            $val = '';
+            switch ($type) {
+                case 'so_header':
+                case 'so_line':
+                    $k = $aliases[$key] ?? $key;
+                    $val = (string)($orderData[$k] ?? '');
+                    break;
+
+                case 'attribute_option':
+                    foreach ($selections as $s) {
+                        if (($s['attr_code'] ?? null) === $key) {
+                            $val = (string)($s['display_label'] ?? $s['opt_value'] ?? $s['opt_code'] ?? '');
+                            break;
+                        }
+                    }
+                    break;
+
+                case 'dimension_modifier':
+                    foreach ($selections as $s) {
+                        $mods = [];
+                        if (!empty($s['dimension_modifiers'])) {
+                            $decoded = json_decode($s['dimension_modifiers'], true);
+                            if (is_array($decoded)) $mods = $decoded;
+                        }
+                        if (isset($mods[$key]) && $mods[$key] !== '') {
+                            $val = (string)$mods[$key];
+                            break;
+                        }
+                    }
+                    break;
+
+                case 'static':
+                    $val = $def;
+                    break;
+            }
+
+            // Fall back to default if nothing resolved.
+            if ($val === '' && $def !== '') $val = $def;
+
+            $map[$tag] = $this->sanitizeForDxf($val);
+        }
+
+        return $map ? strtr($dxf, $map) : $dxf;
     }
 
     /** Strip characters that confuse DXF text fields. */
