@@ -52,8 +52,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     
     if ($action === 'generate_certificate') {
-        $line_id = $_POST['so_line_item_id'] ?? '';
-        
+        $line_id = trim($_POST['so_line_item_id'] ?? '');
+        // Defensive: only proceed if the value looks like a SQL Server UUID.
+        // Without this an ill-formed input crashes the page with a raw
+        // "Conversion failed ... uniqueidentifier" PDOException.
+        if (!preg_match('/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/', $line_id)) {
+            setFlash('error', 'Invalid line item id.');
+            header('Location: certificates.php');
+            exit;
+        }
+
         // Get line and mfg data
         $line = $db->prepare("
             SELECT sli.*, so.so_number, so.customer_name, pc.code as product_code
@@ -64,31 +72,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ");
         $line->execute([$line_id]);
         $line_data = $line->fetch();
-        
+
         $mfg = $db->prepare("SELECT * FROM cert_mfg_data WHERE so_line_item_id = ? AND is_complete = 1");
         $mfg->execute([$line_id]);
         $mfg_data = $mfg->fetch();
-        
+
         if ($line_data && $mfg_data) {
             $cert_number = $line_data['product_code'] . '-TC-' . date('Y') . '-' . str_replace(['SO-', '-'], '', $line_data['so_number']) . '-' . str_pad($line_data['line_number'], 2, '0', STR_PAD_LEFT);
-            
+
             // Find cert template
             $cert_tmpl = $db->prepare("SELECT id FROM cert_templates WHERE product_code_id = ? AND is_active = 1 ORDER BY version DESC");
             $cert_tmpl->execute([$line_data['product_code_id']]);
             $tmpl = $cert_tmpl->fetch();
-            
-            $output_path = "/outputs/{$line_data['so_number']}/line{$line_data['line_number']}/cert/{$cert_number}.xlsx";
-            
+
+            // Write a real fallback certificate file so the row points at something
+            // that actually exists on disk. XLSX template processing requires
+            // PhpSpreadsheet which isn't installed; the .txt fallback gives QC and
+            // engineering verifiable data they can copy into the XLSX manually.
+            $outDir = OUTPUT_PATH . safeSoFolder($line_data['so_number']) . '/line' . (int)$line_data['line_number'] . '/cert/';
+            if (!is_dir($outDir)) @mkdir($outDir, 0755, true);
+            $outFile = $outDir . safeFileName($cert_number) . '.txt';
+
+            $heat = json_decode($mfg_data['heat_numbers'] ?? '{}', true) ?: [];
+            $compliance = json_decode($mfg_data['compliance_checks'] ?? '{}', true) ?: [];
+            $serialRaw  = (json_decode($mfg_data['serial_entries'] ?? '{}', true)['raw'] ?? '');
+
+            $lines = [];
+            $lines[] = "TEST & GUARANTEE CERTIFICATE";
+            $lines[] = "Certificate No : $cert_number";
+            $lines[] = "Generated      : " . date('Y-m-d H:i:s');
+            $lines[] = str_repeat('-', 60);
+            $lines[] = "SO Number      : " . $line_data['so_number'];
+            $lines[] = "Customer       : " . ($line_data['customer_name'] ?? '');
+            $lines[] = "Line Number    : " . $line_data['line_number'];
+            $lines[] = "Product        : " . $line_data['product_code'];
+            $lines[] = "Model Code     : " . ($line_data['model_code_string'] ?? '');
+            $lines[] = "Quantity       : " . $line_data['quantity'];
+            $lines[] = str_repeat('-', 60);
+            $lines[] = "Serial Numbers : " . $serialRaw;
+            $lines[] = "Heat (Body)    : " . ($heat['body'] ?? '');
+            $lines[] = "Heat (Trim)    : " . ($heat['trim'] ?? '');
+            $lines[] = "Heat (Seat)    : " . ($heat['seat'] ?? '');
+            $lines[] = "Inspector      : " . ($mfg_data['inspector_name'] ?? '');
+            $lines[] = "Inspection Date: " . ($mfg_data['inspection_date'] ?? '');
+            $lines[] = str_repeat('-', 60);
+            $lines[] = "Compliance:";
+            foreach ($compliance as $k => $v) {
+                $lines[] = "  - " . str_pad($k, 20) . " : " . ($v ? 'YES' : 'NO');
+            }
+            $lines[] = str_repeat('-', 60);
+            $lines[] = "NOTE: XLSX rendering requires PhpSpreadsheet + a cert_template";
+            $lines[] = "      mapped for this product. This .txt is an interim";
+            $lines[] = "      fallback so the certificate record points at a real file.";
+            file_put_contents($outFile, implode("\n", $lines) . "\n");
+
             $merged = json_encode([
-                'line' => $line_data,
-                'mfg' => $mfg_data,
-                'generated_at' => date('Y-m-d H:i:s')
+                'line'         => $line_data,
+                'mfg'          => $mfg_data,
+                'generated_at' => date('Y-m-d H:i:s'),
+                'fallback'     => true,
+                'fallback_reason' => $tmpl ? 'PhpSpreadsheet not installed' : 'no cert template mapped for product',
             ]);
-            
+
             $db->prepare("INSERT INTO generated_certificates (id, so_line_item_id, cert_template_id, certificate_number, output_file_path, merged_values, inspector_name, inspection_date, status) VALUES (NEWID(), ?, ?, ?, ?, ?, ?, ?, 'generated')")
-               ->execute([$line_id, $tmpl ? $tmpl['id'] : null, $cert_number, $output_path, $merged, $mfg_data['inspector_name'], $mfg_data['inspection_date']]);
-            
-            setFlash('success', "Certificate $cert_number generated.");
+               ->execute([$line_id, $tmpl ? $tmpl['id'] : null, $cert_number, $outFile, $merged, $mfg_data['inspector_name'], $mfg_data['inspection_date']]);
+
+            setFlash('success', "Certificate $cert_number generated as text fallback. Install PhpSpreadsheet + upload a cert_template for proper XLSX output.");
         } else {
             setFlash('error', 'Manufacturing data incomplete.');
         }

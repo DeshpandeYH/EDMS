@@ -2,6 +2,8 @@
 outputs/
 # User-uploaded templates (large binaries; track templates separately if needed)
 uploads/
+# Local-only config overrides (DB creds, server names, etc.)
+config/config.local.php
 # Editor / OS noise
 .vscode/
 .DS_Store

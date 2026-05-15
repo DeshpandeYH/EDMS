@@ -7,68 +7,149 @@ $doc_id = $_GET['doc_id'] ?? '';
 
 if (!$doc_id) { header('Location: sales_orders.php'); exit; }
 
+// Combined documents have so_line_item_id = NULL; LEFT JOIN both sides so the
+// page works for individual AND combined drawings.
 $stmt = $db->prepare("
-    SELECT gd.*, sli.line_number, sli.model_code_string, sli.quantity, sli.generate_individual, sli.generate_combined,
-           so.so_number, so.customer_name, so.project_name, so.po_reference,
-           t.template_code, t.file_path as template_file,
-           pc.code as product_code, pc.name as product_name
+    SELECT gd.*,
+           sli.line_number, sli.model_code_string, sli.quantity,
+           sli.generate_individual, sli.generate_combined,
+           sli.sales_order_id AS line_sales_order_id,
+           COALESCE(so_indiv.id, so_comb.id)                       AS sales_order_id,
+           COALESCE(so_indiv.so_number, so_comb.so_number)         AS so_number,
+           COALESCE(so_indiv.customer_name, so_comb.customer_name) AS customer_name,
+           COALESCE(so_indiv.project_name, so_comb.project_name)   AS project_name,
+           COALESCE(so_indiv.po_reference, so_comb.po_reference)   AS po_reference,
+           t.template_code, t.file_path AS template_file,
+           COALESCE(pc_indiv.code, pc_comb.code) AS product_code,
+           COALESCE(pc_indiv.name, pc_comb.name) AS product_name,
+           cdg.common_attrs_display, cdg.pivot_values
     FROM generated_documents gd
-    JOIN so_line_items sli ON gd.so_line_item_id = sli.id
-    JOIN sales_orders so ON sli.sales_order_id = so.id
-    LEFT JOIN templates t ON gd.template_id = t.id
-    JOIN product_codes pc ON sli.product_code_id = pc.id
+    LEFT JOIN so_line_items sli      ON gd.so_line_item_id = sli.id
+    LEFT JOIN sales_orders  so_indiv ON sli.sales_order_id = so_indiv.id
+    LEFT JOIN product_codes pc_indiv ON sli.product_code_id = pc_indiv.id
+    LEFT JOIN combined_drawing_groups cdg ON gd.combined_group_id = cdg.id
+    LEFT JOIN sales_orders  so_comb  ON cdg.sales_order_id = so_comb.id
+    LEFT JOIN product_codes pc_comb  ON cdg.product_code_id = pc_comb.id
+    LEFT JOIN templates     t        ON gd.template_id = t.id
     WHERE gd.id = ?
 ");
 $stmt->execute([$doc_id]);
 $doc = $stmt->fetch();
 if (!$doc) { setFlash('error', 'Document not found.'); header('Location: sales_orders.php'); exit; }
 
-// Get selections
-$sels = $db->prepare("
-    SELECT a.code as attr_code, a.name as attr_name, a.is_combined_attribute,
-           ao.code as opt_code, ao.value as opt_value, ao.display_label, ao.dimension_modifiers
-    FROM so_line_selections s
-    JOIN attributes a ON s.attribute_id = a.id
-    JOIN attribute_options ao ON s.option_id = ao.id
-    WHERE s.so_line_item_id = ?
-    ORDER BY a.position_in_model
-");
-$sels->execute([$doc['so_line_item_id']]);
-$selections = $sels->fetchAll();
-
-// Handle approval
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_POST['action'] === 'approve') {
-    $db->prepare("UPDATE generated_documents SET status = 'approved', approved_at = GETDATE() WHERE id = ?")->execute([$doc_id]);
-    setFlash('success', 'Document approved.');
-    header("Location: drawing_preview.php?doc_id=$doc_id");
-    exit;
-}
-
 $is_combined = str_contains($doc['document_type'], 'combined');
 $is_internal = str_contains($doc['document_type'], 'internal');
-$type_label = str_replace('_', ' ', ucwords($doc['document_type'], '_'));
+$type_label  = str_replace('_', ' ', ucwords($doc['document_type'], '_'));
+
+// Selections: for individual docs the line's own; for combined docs we pull
+// selections from the FIRST grouped line (representative of the common attrs).
+if ($is_combined && $doc['combined_group_id']) {
+    $sels = $db->prepare("
+        SELECT a.code as attr_code, a.name as attr_name, a.is_combined_attribute,
+               ao.code as opt_code, ao.value as opt_value, ao.display_label, ao.dimension_modifiers
+        FROM so_line_selections s
+        JOIN attributes a ON s.attribute_id = a.id
+        JOIN attribute_options ao ON s.option_id = ao.id
+        JOIN so_line_items sli2 ON s.so_line_item_id = sli2.id
+        WHERE sli2.combined_group_id = ?
+          AND sli2.line_number = (SELECT MIN(line_number) FROM so_line_items WHERE combined_group_id = ?)
+        ORDER BY a.position_in_model
+    ");
+    $sels->execute([$doc['combined_group_id'], $doc['combined_group_id']]);
+} else {
+    $sels = $db->prepare("
+        SELECT a.code as attr_code, a.name as attr_name, a.is_combined_attribute,
+               ao.code as opt_code, ao.value as opt_value, ao.display_label, ao.dimension_modifiers
+        FROM so_line_selections s
+        JOIN attributes a ON s.attribute_id = a.id
+        JOIN attribute_options ao ON s.option_id = ao.id
+        WHERE s.so_line_item_id = ?
+        ORDER BY a.position_in_model
+    ");
+    $sels->execute([$doc['so_line_item_id']]);
+}
+$selections = $sels->fetchAll();
+
+// Pivot data for the combined view.
+$pivotLines = [];
+if ($is_combined && !empty($doc['pivot_values'])) {
+    $decoded = json_decode($doc['pivot_values'], true);
+    if (is_array($decoded)) $pivotLines = $decoded;
+}
+
+// Handle approval / rejection
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $a = $_POST['action'] ?? '';
+    if ($a === 'approve') {
+        $db->prepare("UPDATE generated_documents SET status = 'approved', approved_at = GETDATE() WHERE id = ?")->execute([$doc_id]);
+        setFlash('success', 'Document approved.');
+        header("Location: drawing_preview.php?doc_id=$doc_id");
+        exit;
+    }
+    if ($a === 'reject') {
+        $db->prepare("UPDATE generated_documents SET status = 'rejected' WHERE id = ?")->execute([$doc_id]);
+        setFlash('warning', 'Document rejected. Re-run "Generate Documents" on the SO to replace it.');
+        header("Location: drawing_preview.php?doc_id=$doc_id");
+        exit;
+    }
+}
+
+// Display fields with sensible fallbacks for combined docs.
+$displayModelCode  = $doc['model_code_string'] ?? ($pivotLines
+    ? implode(', ', array_map(fn($l) => $l['model_code'] ?? '', $pivotLines))
+    : '(combined)');
+$displayLineLabel  = $doc['line_number'] ?? 'COMB';
+$backSoId          = $doc['sales_order_id'] ?? '';
 ?>
 
 <h2>Drawing Preview <span class="badge" style="background:var(--<?= $is_combined ? 'orange' : 'accent' ?>-glow ?? var(--accent-glow));color:var(--<?= $is_combined ? 'orange' : 'accent' ?>);"><?= strtoupper($type_label) ?></span></h2>
 <div class="gap-row mb-2">
-    <a href="sales_order_detail.php?id=<?= $db->prepare("SELECT sales_order_id FROM so_line_items WHERE id = ?")->execute([$doc['so_line_item_id']]) ? '' : '' ?>" class="btn btn-outline btn-sm">← Back</a>
-    <span class="tag tag-blue"><?= sanitize($doc['so_number']) ?></span>
-    <span class="tag tag-purple">Line <?= $doc['line_number'] ?></span>
-    <span class="tag tag-cyan mono"><?= sanitize($doc['model_code_string']) ?></span>
+    <a href="sales_order_detail.php?id=<?= sanitize($backSoId) ?>" class="btn btn-outline btn-sm">← Back</a>
+    <span class="tag tag-blue"><?= sanitize($doc['so_number'] ?? '—') ?></span>
+    <span class="tag tag-purple">Line <?= sanitize((string)$displayLineLabel) ?></span>
+    <span class="tag tag-cyan mono"><?= sanitize($displayModelCode) ?></span>
     <span class="tag tag-<?= $is_combined ? 'orange' : 'green' ?>"><?= $is_combined ? 'Combined' : 'Individual' ?></span>
 </div>
+
+<?php if ($is_combined && $pivotLines): ?>
+<div class="panel">
+    <div class="panel-header"><span class="panel-title">Lines in this Combined Drawing</span></div>
+    <div class="panel-body" style="padding:0;">
+        <table class="data-table">
+            <thead><tr><th>Line</th><th>Model Code</th><th>Qty</th><th>Combined-Attribute Value(s)</th></tr></thead>
+            <tbody>
+                <?php foreach ($pivotLines as $pl): ?>
+                <tr>
+                    <td><?= sanitize((string)($pl['line_number'] ?? '')) ?></td>
+                    <td class="mono"><?= sanitize($pl['model_code'] ?? '') ?></td>
+                    <td><?= sanitize((string)($pl['quantity'] ?? '')) ?></td>
+                    <td><?php
+                        $opts = $pl['options'] ?? [];
+                        $bits = [];
+                        foreach ($opts as $o) {
+                            $bits[] = sanitize(($o['attr_code'] ?? '') . '=' . ($o['opt_code'] ?? '') . ' (' . ($o['value'] ?? '') . ')');
+                        }
+                        echo implode(', ', $bits) ?: '—';
+                    ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+<?php endif; ?>
 
 <!-- MODEL CODE BREAKDOWN -->
 <div class="panel">
     <div class="panel-header">
-        <span class="panel-title">Model Code Breakdown</span>
+        <span class="panel-title">Model Code Breakdown<?= $is_combined ? ' (common attributes)' : '' ?></span>
     </div>
     <div class="panel-body">
-        <div class="model-code-display"><?= sanitize($doc['model_code_string']) ?></div>
+        <div class="model-code-display"><?= sanitize($displayModelCode) ?></div>
         <table class="data-table">
             <thead><tr><th>Attribute</th><th>Code</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td>Product</td><td class="mono text-accent"><?= sanitize($doc['product_code']) ?></td><td><?= sanitize($doc['product_name']) ?></td></tr>
+                <tr><td>Product</td><td class="mono text-accent"><?= sanitize($doc['product_code'] ?? '') ?></td><td><?= sanitize($doc['product_name'] ?? '') ?></td></tr>
                 <?php foreach ($selections as $s): ?>
                 <tr<?= $s['is_combined_attribute'] && $is_combined ? ' style="background:var(--orange-bg);"' : '' ?>>
                     <td><?= sanitize($s['attr_name']) ?></td>
@@ -76,7 +157,7 @@ $type_label = str_replace('_', ' ', ucwords($doc['document_type'], '_'));
                         <?= $s['is_combined_attribute'] && $is_combined ? '*' : sanitize($s['opt_code']) ?>
                     </td>
                     <td<?= $s['is_combined_attribute'] && $is_combined ? ' style="color:var(--orange);font-style:italic;"' : '' ?>>
-                        <?= $s['is_combined_attribute'] && $is_combined ? 'Refer to dimension table' : sanitize($s['display_label'] ?: $s['opt_value']) ?>
+                        <?= $s['is_combined_attribute'] && $is_combined ? 'Refer to dimension / lines table above' : sanitize($s['display_label'] ?: $s['opt_value']) ?>
                     </td>
                 </tr>
                 <?php endforeach; ?>
@@ -232,14 +313,18 @@ $type_label = str_replace('_', ' ', ucwords($doc['document_type'], '_'));
 
 <!-- ACTIONS -->
 <div class="btn-group mt-2">
-    <?php if ($doc['status'] !== 'approved'): ?>
-    <form method="POST"><input type="hidden" name="action" value="approve">
+    <?php if ($doc['status'] !== 'approved' && $doc['status'] !== 'rejected'): ?>
+    <form method="POST" style="display:inline"><input type="hidden" name="action" value="approve">
         <button type="submit" class="btn btn-primary">✓ Approve</button>
     </form>
+    <form method="POST" style="display:inline" onsubmit="return confirm('Reject this drawing? It will be marked rejected and you should re-generate from the SO.');">
+        <input type="hidden" name="action" value="reject">
+        <button type="submit" class="btn btn-outline" style="color:var(--red);border-color:var(--red);">✗ Reject</button>
+    </form>
     <?php endif; ?>
-    <a href="<?= BASE_URL ?>/api/download.php?doc_id=<?= $doc_id ?>&format=dwg" class="btn btn-primary">Download DWG Drawing</a>
+    <a href="<?= BASE_URL ?>/api/download.php?doc_id=<?= $doc_id ?>&format=dwg" class="btn btn-primary">Download DWG</a>
     <a href="<?= BASE_URL ?>/api/download.php?doc_id=<?= $doc_id ?>&format=dxf" class="btn btn-outline">Download DXF</a>
-    <a href="<?= BASE_URL ?>/api/download.php?doc_id=<?= $doc_id ?>&format=pdf" class="btn btn-outline">Export PDF</a>
+    <!-- PDF export not implemented; the download endpoint only emits DWG or DXF. -->
 </div>
 
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>

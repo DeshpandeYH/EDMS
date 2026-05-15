@@ -24,11 +24,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $ext = strtolower(pathinfo($_FILES['template_file']['name'], PATHINFO_EXTENSION));
                 
                 if (in_array($ext, $allowed_ext)) {
-                    $upload_dir = TEMPLATE_PATH . $product_code_id . '/';
+                    // SECURITY: sanitize both path segments. $template_code came
+                    // from POST and was used as a filename — path traversal risk.
+                    $safe_product_dir = preg_replace('/[^A-Za-z0-9_\-]/', '_', $product_code_id);
+                    $safe_template_code = preg_replace('/[^A-Za-z0-9_\-]/', '_', $template_code);
+                    if ($safe_template_code === '') $safe_template_code = 'template_' . bin2hex(random_bytes(4));
+
+                    $upload_dir = TEMPLATE_PATH . $safe_product_dir . '/';
                     if (!is_dir($upload_dir)) mkdir($upload_dir, 0755, true);
-                    
-                    $filename = $template_code . '.' . $ext;
-                    $file_path = 'templates/' . $product_code_id . '/' . $filename;
+
+                    $filename = $safe_template_code . '.' . $ext;
+                    $file_path = 'templates/' . $safe_product_dir . '/' . $filename;
                     move_uploaded_file($_FILES['template_file']['tmp_name'], $upload_dir . $filename);
                     $file_format = $ext;
 

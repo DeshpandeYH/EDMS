@@ -71,7 +71,8 @@ CREATE TABLE attributes (
 );
 GO
 
--- Add FK for combined_attribute_id
+-- Add FK for combined_attribute_id (idempotent guard)
+IF NOT EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK_product_combined_attr')
 ALTER TABLE product_codes ADD CONSTRAINT FK_product_combined_attr 
     FOREIGN KEY (combined_attribute_id) REFERENCES attributes(id);
 GO
@@ -368,7 +369,7 @@ IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'generated_certificates')
 CREATE TABLE generated_certificates (
     id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
     so_line_item_id UNIQUEIDENTIFIER NOT NULL REFERENCES so_line_items(id),
-    cert_template_id UNIQUEIDENTIFIER NOT NULL REFERENCES cert_templates(id),
+    cert_template_id UNIQUEIDENTIFIER NULL REFERENCES cert_templates(id),
     certificate_number VARCHAR(50) NOT NULL UNIQUE,
     output_file_path VARCHAR(500),
     merged_values NVARCHAR(MAX), -- JSON

@@ -229,7 +229,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Output dir + file name.
                     $baseName = preg_replace('/[^A-Za-z0-9_\-]/','_',
                         "{$template_code}-{$line['model_code_string']}");
-                    $outDir = OUTPUT_PATH . $order['so_number'] . '/line' . $line['line_number'] . '/' . $info['folder'] . '/';
+                    $outDir = OUTPUT_PATH . safeSoFolder($order['so_number']) . '/line' . $line['line_number'] . '/' . $info['folder'] . '/';
                     if (!is_dir($outDir)) @mkdir($outDir, 0755, true);
 
                     // Run the processor — copy template, inject SO data, save as new DWG.
@@ -259,13 +259,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     $output_path = $producedAbs;
 
+                    // BUG 2 FIX: if no combination_matrix row matched the model code,
+                    // the document was produced from a generic fallback template.
+                    // Tag it so engineering knows to verify, and surface a loud
+                    // ERROR (not a quiet warning) on the page.
+                    $unmapped = !$match;
+                    $injectedRecord = json_decode($injected, true) ?: [];
+                    if ($unmapped) {
+                        $injectedRecord['unmapped'] = true;
+                        $injectedRecord['unmapped_reason'] = "No combination_matrix row for product+$ot+key='$combo_key'. Fallback template used — VERIFY MANUALLY.";
+                    }
+                    $injectedStored = json_encode($injectedRecord);
+
                     // Create document record with the real produced file path.
                     $db->prepare("INSERT INTO generated_documents (id, so_line_item_id, template_id, document_type, sap_item_code, output_file_path, injected_values, status) VALUES (NEWID(), ?, ?, ?, ?, ?, ?, 'generated')")
-                       ->execute([$line['id'], $template_id, $ot, $sap_code, $output_path, $injected]);
+                       ->execute([$line['id'], $template_id, $ot, $sap_code, $output_path, $injectedStored]);
                     $generated++;
 
-                    if (!$match) {
-                        $errors[] = "Line {$line['line_number']} $ot: no combination match for key '$combo_key'";
+                    if ($unmapped) {
+                        $errors[] = "ERROR Line {$line['line_number']} $ot: no combination match for key '$combo_key' — drawing uses a FALLBACK template and is tagged 'unmapped'. Verify manually or add a combination_template_map row.";
                     }
                 }
             }
@@ -275,7 +287,280 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $db->prepare("UPDATE so_line_items SET status = 'generated', updated_at = GETDATE() WHERE id = ?")->execute([$line['id']]);
             }
         }
-        
+
+        // ============================================================
+        // BUG 1 FIX: COMBINED DRAWINGS
+        // ------------------------------------------------------------
+        // Lines with generate_combined = 1 sharing the same product and the
+        // same selections for all NON-combined attributes auto-group into a
+        // single combined drawing. (Per DEVELOPMENT.md §combined drawings.)
+        // ============================================================
+        $combinedLinesStmt = $db->prepare("
+            SELECT sli.*, pc.code as product_code, pc.name as product_name, pc.supports_combined_dwg
+            FROM so_line_items sli
+            JOIN product_codes pc ON sli.product_code_id = pc.id
+            WHERE sli.sales_order_id = ?
+              AND sli.generate_combined = 1
+              AND sli.status IN ('resolved','generated')
+        ");
+        $combinedLinesStmt->execute([$so_id]);
+        $combinedLines = $combinedLinesStmt->fetchAll();
+
+        // Group lines by product + hash of non-combined selections.
+        $groups = []; // groupKey => ['product_code_id'=>..., 'product_code'=>..., 'lines'=>[], 'common_sels'=>[], 'combined_attr_ids'=>[]]
+        foreach ($combinedLines as $cl) {
+            // Pull this line's selections joined with attribute metadata.
+            $s = $db->prepare("
+                SELECT a.id as attribute_id, a.code as attr_code, a.name as attr_name,
+                       a.position_in_model, a.is_combined_attribute,
+                       a.affects_engg_dwg, a.affects_internal_dwg,
+                       ao.id as option_id, ao.code as opt_code, ao.value as opt_value,
+                       ao.display_label, ao.dimension_modifiers
+                FROM so_line_selections sl
+                JOIN attributes a ON sl.attribute_id = a.id
+                JOIN attribute_options ao ON sl.option_id = ao.id
+                WHERE sl.so_line_item_id = ?
+                ORDER BY a.position_in_model
+            ");
+            $s->execute([$cl['id']]);
+            $allSels = $s->fetchAll();
+
+            // Common (non-combined) selections drive the group key.
+            $commonSels = array_values(array_filter($allSels, fn($r) => !$r['is_combined_attribute']));
+            $commonKeyParts = [];
+            foreach ($commonSels as $r) {
+                $commonKeyParts[] = $r['attr_code'] . '=' . $r['opt_code'];
+            }
+            $groupKey = $cl['product_code_id'] . '|' . implode('|', $commonKeyParts);
+
+            if (!isset($groups[$groupKey])) {
+                $groups[$groupKey] = [
+                    'product_code_id'   => $cl['product_code_id'],
+                    'product_code'      => $cl['product_code'],
+                    'product_name'      => $cl['product_name'],
+                    'common_sels'       => $commonSels,
+                    'all_sels_template' => $allSels, // first line's full selections (used for dim table)
+                    'lines'             => [],
+                    'combined_opt_rows' => [], // one per line: the combined-attribute selection(s)
+                ];
+            }
+            $groups[$groupKey]['lines'][] = $cl;
+            $combinedOnly = array_values(array_filter($allSels, fn($r) => $r['is_combined_attribute']));
+            $groups[$groupKey]['combined_opt_rows'][] = [
+                'line_number' => $cl['line_number'],
+                'model_code'  => $cl['model_code_string'],
+                'quantity'    => $cl['quantity'],
+                'options'     => $combinedOnly,
+            ];
+        }
+
+        foreach ($groups as $groupKey => $g) {
+            if (count($g['lines']) < 1) continue; // safety
+
+            $commonAttrsHash    = hash('sha256', $groupKey);
+            $commonAttrsDisplay = implode(', ', array_map(
+                fn($r) => $r['attr_code'] . ':' . $r['opt_code'],
+                $g['common_sels']
+            ));
+            $pivotValuesJson = json_encode(array_map(function ($r) {
+                return [
+                    'line_number' => $r['line_number'],
+                    'model_code'  => $r['model_code'],
+                    'quantity'    => $r['quantity'],
+                    'options'     => array_map(fn($o) => [
+                        'attr_code' => $o['attr_code'],
+                        'opt_code'  => $o['opt_code'],
+                        'value'     => $o['display_label'] ?? $o['opt_value'],
+                    ], $r['options']),
+                ];
+            }, $g['combined_opt_rows']));
+
+            // Find or create the group row, then bind each line to it.
+            $find = $db->prepare("
+                SELECT id FROM combined_drawing_groups
+                WHERE sales_order_id = ? AND product_code_id = ? AND common_attrs_hash = ?
+            ");
+            $find->execute([$so_id, $g['product_code_id'], $commonAttrsHash]);
+            $existing = $find->fetch();
+            if ($existing) {
+                $groupId = $existing['id'];
+                $db->prepare("UPDATE combined_drawing_groups SET common_attrs_display = ?, pivot_values = ? WHERE id = ?")
+                   ->execute([$commonAttrsDisplay, $pivotValuesJson, $groupId]);
+            } else {
+                $groupId = generateUUID();
+                $db->prepare("
+                    INSERT INTO combined_drawing_groups
+                        (id, sales_order_id, product_code_id, common_attrs_hash, common_attrs_display, pivot_values)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ")->execute([$groupId, $so_id, $g['product_code_id'], $commonAttrsHash, $commonAttrsDisplay, $pivotValuesJson]);
+            }
+            foreach ($g['lines'] as $cl) {
+                $db->prepare("UPDATE so_line_items SET combined_group_id = ? WHERE id = ?")
+                   ->execute([$groupId, $cl['id']]);
+            }
+
+            // Combined combination_key = opt_codes of NON-combined attrs in position order
+            // (matches how pages/combinations.php builds keys for *_combined output types).
+            $comboKeyOutputs = ['engg_combined', 'internal_combined'];
+            $dimColsStmt = $db->prepare("SELECT * FROM dim_table_columns WHERE product_code_id = ? ORDER BY sort_order");
+            $dimColsStmt->execute([$g['product_code_id']]);
+            $dimColumns = $dimColsStmt->fetchAll();
+
+            $anchorStmt = $db->prepare("SELECT anchor_type, x_coord, y_coord FROM template_anchor_config WHERE product_code_id = ?");
+            $anchorStmt->execute([$g['product_code_id']]);
+            $anchorConfig = [];
+            foreach ($anchorStmt->fetchAll() as $a) {
+                $anchorConfig[$a['anchor_type']] = ['x' => (float)$a['x_coord'], 'y' => (float)$a['y_coord']];
+            }
+
+            foreach ($comboKeyOutputs as $ot) {
+                $flagCol = $ot === 'engg_combined' ? 'affects_engg_dwg' : 'affects_internal_dwg';
+                // Build key from common (non-combined) selections that affect this output.
+                $opt_codes = [];
+                foreach ($g['common_sels'] as $r) {
+                    if ($r[$flagCol]) $opt_codes[] = $r['opt_code'];
+                }
+                $combo_key = implode('-', $opt_codes);
+
+                $combo = $db->prepare("
+                    SELECT cm.id, cm.combination_key, ctm.template_id, ctm.sap_item_code, t.template_code
+                    FROM combination_matrix cm
+                    LEFT JOIN combination_template_map ctm ON cm.id = ctm.combination_id
+                    LEFT JOIN templates t ON ctm.template_id = t.id
+                    WHERE cm.product_code_id = ? AND cm.output_type = ? AND cm.combination_key = ? AND cm.is_active = 1
+                ");
+                $combo->execute([$g['product_code_id'], $ot, $combo_key]);
+                $match = $combo->fetch();
+
+                $template_id   = $match['template_id']   ?? null;
+                $sap_code      = $match['sap_item_code'] ?? null;
+                $template_code = $match['template_code'] ?? null;
+
+                // Same fallback chain as the individual branch.
+                if (!$template_id) {
+                    $fb = $db->prepare("SELECT id, template_code FROM templates WHERE product_code_id = ? AND template_type = ? AND is_active = 1 ORDER BY version DESC");
+                    $fb->execute([$g['product_code_id'], $ot]);
+                    $f = $fb->fetch();
+                    if ($f) { $template_id = $f['id']; $template_code = $f['template_code']; }
+                }
+                if (!$template_id) {
+                    $fb = $db->prepare("SELECT id, template_code FROM templates WHERE product_code_id = ? AND is_active = 1 ORDER BY version DESC");
+                    $fb->execute([$g['product_code_id']]);
+                    $f = $fb->fetch();
+                    if ($f) { $template_id = $f['id']; $template_code = $f['template_code']; }
+                }
+                if (!$template_code) {
+                    $template_code = $g['product_code'] . '-' . strtoupper(str_replace('_', '-', $ot));
+                }
+
+                $tplFile = null;
+                if ($template_id) {
+                    $row = $db->prepare("SELECT file_path FROM templates WHERE id = ?");
+                    $row->execute([$template_id]);
+                    $tr = $row->fetch();
+                    if ($tr) {
+                        $cand = $tr['file_path'];
+                        if ($cand && !is_file($cand)) {
+                            $abs = UPLOAD_PATH . ltrim($cand, '/\\');
+                            if (is_file($abs)) $cand = $abs;
+                        }
+                        $tplFile = is_file($cand) ? $cand : null;
+                    }
+                }
+
+                // Combined model_code: comma-joined list of grouped model codes.
+                $modelCodes = array_map(fn($cl) => $cl['model_code_string'], $g['lines']);
+                $combinedModelCode = implode(', ', array_filter($modelCodes));
+
+                // Order data: use the first line's full selections to render the
+                // dim table (common attrs drive it), and surface ALL model codes
+                // in the title block and combined-summary stamp.
+                $orderData = [
+                    'so_number'     => $order['so_number'],
+                    'customer_name' => $order['customer_name'],
+                    'project_name'  => $order['project_name'],
+                    'po_reference'  => $order['po_reference'],
+                    'delivery_date' => $order['delivery_date'],
+                    'model_code'    => $combinedModelCode,
+                    'quantity'      => array_sum(array_map(fn($cl) => (int)$cl['quantity'], $g['lines'])),
+                    'line_number'   => 'COMB',
+                    'product_code'  => $g['product_code'],
+                    'product_name'  => $g['product_name'],
+                    'document_type' => $ot,
+                    'sap_item_code' => $sap_code,
+                    'template_code' => $template_code,
+                    'combined_group_id' => $groupId,
+                    'combined_lines'    => $g['combined_opt_rows'],
+                ];
+
+                $info = $ot === 'engg_combined'
+                    ? ['ext' => 'dwg', 'folder' => 'engg_combined']
+                    : ['ext' => 'dwg', 'folder' => 'internal_combined'];
+
+                $baseName = preg_replace('/[^A-Za-z0-9_\-]/','_',
+                    "{$template_code}-COMB-" . substr($commonAttrsHash, 0, 8));
+                $outDir = OUTPUT_PATH . safeSoFolder($order['so_number']) . '/combined/' . $info['folder'] . '/';
+                if (!is_dir($outDir)) @mkdir($outDir, 0755, true);
+
+                $producedAbs = null;
+                try {
+                    if ($tplFile) {
+                        $proc = new DWGTemplateProcessor();
+                        $fmt  = ($proc->isAvailable()) ? 'dwg' : 'dxf';
+                        $producedAbs = $proc->process(
+                            $tplFile, $orderData, $g['all_sels_template'], $dimColumns,
+                            $outDir, $baseName, $fmt, $anchorConfig
+                        );
+                    } else {
+                        $gen = new DXFGenerator();
+                        $producedAbs = $outDir . $baseName . '.dxf';
+                        file_put_contents($producedAbs, $gen->generate($orderData, $g['all_sels_template'], $dimColumns));
+                        $errors[] = "Combined group ($commonAttrsDisplay) $ot: no template uploaded for product — used fallback DXF.";
+                    }
+                } catch (Throwable $e) {
+                    $errors[] = "Combined group ($commonAttrsDisplay) $ot: " . $e->getMessage();
+                    $gen = new DXFGenerator();
+                    $producedAbs = $outDir . $baseName . '.dxf';
+                    file_put_contents($producedAbs, $gen->generate($orderData, $g['all_sels_template'], $dimColumns));
+                }
+
+                $unmapped = !$match;
+                $injectedRecord = [
+                    'so_number'     => $order['so_number'],
+                    'customer'      => $order['customer_name'],
+                    'group_id'      => $groupId,
+                    'common_attrs'  => $commonAttrsDisplay,
+                    'lines'         => $g['combined_opt_rows'],
+                ];
+                if ($unmapped) {
+                    $injectedRecord['unmapped'] = true;
+                    $injectedRecord['unmapped_reason'] = "No combination_matrix row for product+$ot+key='$combo_key'. Fallback template used — VERIFY MANUALLY.";
+                }
+                $injectedStored = json_encode($injectedRecord);
+
+                // Replace previous combined doc for this group+type so re-runs don't duplicate.
+                $db->prepare("DELETE FROM generated_documents WHERE combined_group_id = ? AND document_type = ?")
+                   ->execute([$groupId, $ot]);
+                $db->prepare("
+                    INSERT INTO generated_documents
+                        (id, so_line_item_id, combined_group_id, template_id, document_type, sap_item_code, output_file_path, injected_values, status)
+                    VALUES (NEWID(), NULL, ?, ?, ?, ?, ?, ?, 'generated')
+                ")->execute([$groupId, $template_id, $ot, $sap_code, $producedAbs, $injectedStored]);
+                $generated++;
+
+                if ($unmapped) {
+                    $errors[] = "ERROR combined group ($commonAttrsDisplay) $ot: no combination match for key '$combo_key' — drawing uses a FALLBACK template and is tagged 'unmapped'. Verify manually or add a combination_template_map row.";
+                }
+            }
+
+            // Mark contributing lines as 'generated' (they now have at least the combined drawing).
+            foreach ($g['lines'] as $cl) {
+                $db->prepare("UPDATE so_line_items SET status = 'generated', updated_at = GETDATE() WHERE id = ?")
+                   ->execute([$cl['id']]);
+            }
+        }
+        // END BUG 1 FIX
+
         if ($generated > 0) {
             $db->prepare("UPDATE sales_orders SET status = 'in_progress', updated_at = GETDATE() WHERE id = ?")->execute([$so_id]);
         }

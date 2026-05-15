@@ -4,16 +4,26 @@ require_once __DIR__ . '/../includes/header.php';
 
 $db = getDB();
 
-// Fetch all generated documents
+// Fetch all generated documents.
+// IMPORTANT: combined documents have so_line_item_id = NULL and are tied via
+// combined_group_id instead. We LEFT JOIN both so individual AND combined
+// drawings appear in the list.
 $docs = $db->query("
-    SELECT gd.*, sli.line_number, sli.model_code_string, sli.quantity,
-           so.so_number, so.customer_name,
-           t.template_code, pc.code as product_code
+    SELECT gd.*,
+           sli.line_number, sli.model_code_string, sli.quantity,
+           COALESCE(so_indiv.so_number, so_comb.so_number)         AS so_number,
+           COALESCE(so_indiv.customer_name, so_comb.customer_name) AS customer_name,
+           t.template_code,
+           COALESCE(pc_indiv.code, pc_comb.code) AS product_code,
+           cdg.common_attrs_display
     FROM generated_documents gd
-    JOIN so_line_items sli ON gd.so_line_item_id = sli.id
-    JOIN sales_orders so ON sli.sales_order_id = so.id
-    LEFT JOIN templates t ON gd.template_id = t.id
-    JOIN product_codes pc ON sli.product_code_id = pc.id
+    LEFT JOIN so_line_items sli       ON gd.so_line_item_id = sli.id
+    LEFT JOIN sales_orders  so_indiv  ON sli.sales_order_id = so_indiv.id
+    LEFT JOIN product_codes pc_indiv  ON sli.product_code_id = pc_indiv.id
+    LEFT JOIN combined_drawing_groups cdg ON gd.combined_group_id = cdg.id
+    LEFT JOIN sales_orders  so_comb   ON cdg.sales_order_id = so_comb.id
+    LEFT JOIN product_codes pc_comb   ON cdg.product_code_id = pc_comb.id
+    LEFT JOIN templates     t         ON gd.template_id = t.id
     ORDER BY gd.generated_at DESC
 ")->fetchAll();
 
@@ -71,8 +81,8 @@ $combined_docs = array_filter($docs, fn($d) => str_contains($d['document_type'],
                 <?php else: ?>
                 <?php foreach ($combined_docs as $d): ?>
                 <tr>
-                    <td class="mono text-accent"><?= sanitize($d['so_number']) ?></td>
-                    <td class="mono"><?= sanitize($d['product_code']) ?></td>
+                    <td class="mono text-accent"><?= sanitize($d['so_number'] ?? '—') ?></td>
+                    <td class="mono"><?= sanitize($d['product_code'] ?? '—') ?></td>
                     <td><span class="tag tag-<?= str_contains($d['document_type'], 'engg') ? 'blue' : 'purple' ?>"><?= str_contains($d['document_type'], 'engg') ? 'Engg Combined' : 'Internal Combined' ?></span></td>
                     <td><span class="tag tag-<?= $d['status'] === 'approved' ? 'green' : 'blue' ?>"><?= ucfirst($d['status']) ?></span></td>
                     <td style="font-size:0.75rem;"><?= date('M d, Y', strtotime($d['generated_at'])) ?></td>

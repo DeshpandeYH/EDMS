@@ -18,17 +18,27 @@ if (!$doc_id) {
 
 $db = getDB();
 
-// Get document + order + product details
+// Get document + order + product details.
+// Combined documents have so_line_item_id = NULL; LEFT JOIN both sides so this
+// endpoint works for individual AND combined drawings.
 $stmt = $db->prepare("
     SELECT gd.*, t.file_path as template_file, t.template_code, t.file_format,
            sli.model_code_string, sli.line_number, sli.quantity,
-           so.so_number, so.customer_name, so.project_name, so.po_reference, so.delivery_date,
-           pc.code as product_code, pc.name as product_name
+           COALESCE(so_indiv.so_number, so_comb.so_number)         AS so_number,
+           COALESCE(so_indiv.customer_name, so_comb.customer_name) AS customer_name,
+           COALESCE(so_indiv.project_name, so_comb.project_name)   AS project_name,
+           COALESCE(so_indiv.po_reference, so_comb.po_reference)   AS po_reference,
+           COALESCE(so_indiv.delivery_date, so_comb.delivery_date) AS delivery_date,
+           COALESCE(pc_indiv.code, pc_comb.code) AS product_code,
+           COALESCE(pc_indiv.name, pc_comb.name) AS product_name
     FROM generated_documents gd
     LEFT JOIN templates t ON gd.template_id = t.id
-    JOIN so_line_items sli ON gd.so_line_item_id = sli.id
-    JOIN sales_orders so ON sli.sales_order_id = so.id
-    JOIN product_codes pc ON sli.product_code_id = pc.id
+    LEFT JOIN so_line_items sli ON gd.so_line_item_id = sli.id
+    LEFT JOIN sales_orders  so_indiv ON sli.sales_order_id = so_indiv.id
+    LEFT JOIN product_codes pc_indiv ON sli.product_code_id = pc_indiv.id
+    LEFT JOIN combined_drawing_groups cdg ON gd.combined_group_id = cdg.id
+    LEFT JOIN sales_orders  so_comb  ON cdg.sales_order_id = so_comb.id
+    LEFT JOIN product_codes pc_comb  ON cdg.product_code_id = pc_comb.id
     WHERE gd.id = ?
 ");
 $stmt->execute([$doc_id]);
@@ -38,6 +48,32 @@ if (!$doc) {
     http_response_code(404);
     die('Document not found');
 }
+
+// Combined docs: the file was produced once at generation time and lives at
+// output_file_path. We do NOT regenerate combined drawings on download because
+// that would require re-grouping the lines and is owned by the page handler.
+// Just stream the existing file.
+$isCombinedDoc = empty($doc['so_line_item_id']) && !empty($doc['combined_group_id']);
+if ($isCombinedDoc) {
+    $existing = $doc['output_file_path'] ?? '';
+    if (!$existing || !is_file($existing)) {
+        http_response_code(404);
+        die('Combined drawing file missing on disk. Re-run "Generate Documents" on the sales order.');
+    }
+    $extOut = strtolower(pathinfo($existing, PATHINFO_EXTENSION));
+    $mime   = $extOut === 'dwg' ? 'application/acad' : 'application/dxf';
+    $bytes  = file_get_contents($existing);
+    $base   = preg_replace('/[^A-Za-z0-9_\-]/', '_',
+        ($doc['so_number'] ?? 'SO') . '_COMBINED_' . ($doc['product_code'] ?? 'PROD') . '_' . strtoupper($doc['document_type']));
+    header('Content-Type: ' . $mime);
+    header('Content-Disposition: attachment; filename="' . $base . '.' . $extOut . '"');
+    header('Content-Length: ' . strlen($bytes));
+    header('Cache-Control: no-cache, must-revalidate');
+    echo $bytes;
+    exit;
+}
+
+// From here on we KNOW we have a line-item-scoped (individual) document.
 
 // Get all attribute selections for this line item
 $selections = $db->prepare("
@@ -98,8 +134,9 @@ $type_short = str_replace(
 $download_name = "{$doc['so_number']}_Line{$doc['line_number']}_{$doc['product_code']}_{$type_short}";
 $download_name = preg_replace('/[^A-Za-z0-9_\-]/', '_', $download_name);
 
-// Output dir per SO + line
-$outputDir = OUTPUT_PATH . $doc['so_number'] . '/line' . $doc['line_number'] . '/';
+// Output dir per SO + line (use safeSoFolder so the same SO doesn't end up
+// split across hyphen/underscore-named folders).
+$outputDir = OUTPUT_PATH . safeSoFolder($doc['so_number']) . '/line' . (int)$doc['line_number'] . '/';
 if (!is_dir($outputDir)) {
     mkdir($outputDir, 0755, true);
 }

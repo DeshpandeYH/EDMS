@@ -55,9 +55,13 @@ $existing = $db->prepare("SELECT id FROM sales_orders WHERE so_number = ?");
 $existing->execute([$so_number]);
 $old = $existing->fetch();
 if ($old) {
-    // Clean up old data
-    $db->prepare("DELETE FROM generated_documents WHERE so_line_item_id IN (SELECT id FROM so_line_items WHERE sales_order_id = ?)")->execute([$old['id']]);
+    // Clean up old data — child rows first to satisfy FK constraints.
+    $db->prepare("DELETE FROM generated_certificates WHERE so_line_item_id IN (SELECT id FROM so_line_items WHERE sales_order_id = ?)")->execute([$old['id']]);
+    $db->prepare("DELETE FROM cert_mfg_data            WHERE so_line_item_id IN (SELECT id FROM so_line_items WHERE sales_order_id = ?)")->execute([$old['id']]);
+    $db->prepare("DELETE FROM generated_documents WHERE so_line_item_id IN (SELECT id FROM so_line_items WHERE sales_order_id = ?) OR combined_group_id IN (SELECT id FROM combined_drawing_groups WHERE sales_order_id = ?)")->execute([$old['id'], $old['id']]);
     $db->prepare("DELETE FROM so_line_selections WHERE so_line_item_id IN (SELECT id FROM so_line_items WHERE sales_order_id = ?)")->execute([$old['id']]);
+    $db->prepare("UPDATE so_line_items SET combined_group_id = NULL WHERE sales_order_id = ?")->execute([$old['id']]);
+    $db->prepare("DELETE FROM combined_drawing_groups WHERE sales_order_id = ?")->execute([$old['id']]);
     $db->prepare("DELETE FROM so_line_items WHERE sales_order_id = ?")->execute([$old['id']]);
     $db->prepare("DELETE FROM sales_orders WHERE id = ?")->execute([$old['id']]);
     echo "  (Cleaned up previous test order)\n";

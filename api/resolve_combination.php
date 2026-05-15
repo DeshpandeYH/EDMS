@@ -8,24 +8,31 @@ require_once __DIR__ . '/../config/database.php';
 header('Content-Type: application/json');
 
 $product_id = $_GET['product_id'] ?? '';
-$selections = $_GET['selections'] ?? ''; // JSON string: {attr_id: option_id}
+$selections_raw = $_GET['selections'] ?? '';
 
-if (!$product_id || !$selections) {
+if (!$product_id || $selections_raw === '') {
     jsonResponse(['error' => 'product_id and selections required'], 400);
 }
 
-$selections = json_decode($selections, true);
-if (!$selections) {
+// `selections` is a JSON object {attr_id: option_id}. An empty object {} is
+// valid (no attributes picked yet) — we still want to respond with per-output
+// 'no_affecting_attrs' status instead of 400.
+$selections = json_decode($selections_raw, true);
+if (!is_array($selections)) {
     jsonResponse(['error' => 'Invalid selections JSON'], 400);
 }
 
 $db = getDB();
 
-// Get attribute details for selected options
+// Get attribute details for selected options.
+// IMPORTANT: rows MUST be ordered by attributes.position_in_model so the
+// combination_key we build below matches the canonical key stored in
+// combination_matrix (which is built in position order — see pages/combinations.php).
 $option_details = [];
 foreach ($selections as $attr_id => $option_id) {
     $stmt = $db->prepare("
-        SELECT a.code as attr_code, a.affects_engg_dwg, a.affects_internal_dwg, a.affects_sap_item, a.affects_test_cert, a.is_combined_attribute,
+        SELECT a.code as attr_code, a.position_in_model,
+               a.affects_engg_dwg, a.affects_internal_dwg, a.affects_sap_item, a.affects_test_cert, a.is_combined_attribute,
                ao.code as opt_code, ao.value as opt_value, ao.dimension_modifiers
         FROM attributes a
         JOIN attribute_options ao ON ao.attribute_id = a.id AND ao.id = ?
@@ -35,6 +42,8 @@ foreach ($selections as $attr_id => $option_id) {
     $detail = $stmt->fetch();
     if ($detail) $option_details[] = $detail;
 }
+// Canonicalize order by position_in_model so combination_key is deterministic.
+usort($option_details, fn($a, $b) => ((int)($a['position_in_model'] ?? 0)) <=> ((int)($b['position_in_model'] ?? 0)));
 
 // Resolve for each output type
 $output_types = [
